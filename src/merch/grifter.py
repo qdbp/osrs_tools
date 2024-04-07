@@ -1,27 +1,29 @@
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from time import sleep
-from typing import Iterable
+from typing import Iterable, NoReturn
 from warnings import filterwarnings
-from colored import fg, stylize
 
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.signal as sg
+from colored import fg, stylize
 from obspy.signal.detrend import polynomial as poly_detrend
-from pandas import DataFrame, Series
+from pandas import DataFrame, Timedelta
+from scipy.stats import linregress
 
-from src.api import PriceAPI
-from src.recipe import Item, Recipe
+from src.merch.api import PriceAPI
+from src.merch.recipe import BankableRecipe, Item, Recipe
 
 filterwarnings("error", message="Mean of empty slice")
 
 
+@dataclass
 class Grifter:
-    def __init__(self, api: PriceAPI):
-        self.api = api
+    api: PriceAPI
 
-    def value_chain_snapshot_1h(self, recipe: Recipe):
+    def value_chain_snapshot_1h(self, recipe: Recipe) -> None:
 
         self.api.refresh_1h()
 
@@ -31,60 +33,27 @@ class Grifter:
         for name, count in recipe.ingredients.items():
             prices = api.prices_1h[name]
             # be a little pessimistic
-            cost += (
-                count * (2 / 3) * prices["avgHighPrice"]
-                + (1 / 3) * prices["avgLowPrice"]
-            )
+            cost += count * (2 / 3) * prices["avgHighPrice"] + (1 / 3) * prices["avgLowPrice"]
 
-        for name, item in recipe.products.items():
+        for name, count in recipe.products.items():
             prices = api.prices_1h[name]
-            value += (1 / 3) * prices["avgHighPrice"] + (2 / 3) * prices["avgLowPrice"]
+            value += (count / 3) * prices["avgHighPrice"] + (2 * count / 3) * prices["avgLowPrice"]
 
-        print(f"Recipe {recipe.name}:")
-        print("\t", recipe.ingredients)
-        print(f"\tcost: {cost:.0f}")
-        print(f"\tvalue: {value:.0f}")
-        print(f"\tprofit: {value - cost:.0f}")
-        print(f"\troi: {(value - cost) / cost:.1%}")
+        profit = value - cost
 
-    def scan_bands(self, smooth="30min"):
+        print(f"Recipe {recipe.name}: {recipe.ingredients} -> {recipe.products}")
+        print(f"\t{value: 5.0f} - {cost: 5.0f} => {profit: 5.0f} ({profit / cost:.1%} roi)")
 
-        prices, meta = self.api.load_universe(
-            min_4h_vol=100_000,
-            min_lmt=1000,
-            max_low=30,
-        )
+        if isinstance(recipe, BankableRecipe):
+            buy_amt = float("inf")
+            for name, count in recipe.ingredients.items():
+                buy_amt = min(buy_amt, api.prices_1h[name]["lowPriceVolume"] / (3 * count))
 
-        for item, idf in prices.groupby("name"):
-
-            idf = idf.rolling(smooth, on="ts").mean()
-
-            min_price = idf["low"].min()
-            max_price = idf["high"].max()
-
-            prices = np.arange(min_price, max_price + 1, dtype=np.uint32)
-
-            bands = {
-                "low": [
-                    len(idf[idf["low"].between(price - 0.5, price + 0.4999)]) / len(idf)
-                    for price in prices
-                ],
-                "high": [
-                    len(idf[idf["high"].between(price - 0.5, price + 0.4999)])
-                    / len(idf)
-                    for price in prices
-                ],
-            }
-
-            crossover_rate = (idf["high"] < idf["low"] - 0.1).sum() / len(idf)
-
-            band_df = DataFrame.from_dict(bands).set_index(prices)
-            band_df["low_cum"] = band_df["low"].cumsum()
-            band_df["high_cum"] = band_df["high"][::-1].cumsum()
-
-            print(item)
-            print(f"xover rate: {crossover_rate:.3f}")
-            print(band_df)
+            print(f"\tAssuming we capture 1/3 the volume, we can make {buy_amt:.1f} / hour")
+            print(f"\tThis will make ${buy_amt * profit:.0f}")
+            print(
+                f"\tAssuming we work nonstop, we can make " f"${profit * recipe.pps(buy_amt):.0f} / hour"
+            )
 
     def scan_var(
         self,
@@ -92,103 +61,67 @@ class Grifter:
         max_price: float = 10_000,
         min_4h_vol: float = 2500,
         max_null_ratio: float = 0.3,
-        detrend_order=7,
-        jitter_lookback_days: int = 5,
-        max_trend: float = 0.015,
-        min_jitter: float = 0.03,
-        min_profit: float = 30_000,
-        min_roi: float = 1.0,
+        min_limit: int = 200,
+        quantile_days: int = 1,
     ):
+        """
+        Runs a variance-based scan to try and find markets in need of a market-maker.
+
+        Args:
+            min_price:
+            max_price:
+            min_4h_vol:
+            max_null_ratio:
+            detrend_order:
+            jitter_lookback_days:
+            max_trend:
+            min_jitter:
+            min_profit:
+            min_roi:
+            min_limit:
+
+        Returns:
+
+        """
 
         prices, meta = self.api.load_universe(
-            min_lmt=1000, min_low=min_price, max_low=max_price, min_4h_vol=min_4h_vol
+            min_lmt=min_limit,
+            min_low=min_price,
+            max_low=max_price,
+            min_4h_vol=min_4h_vol,
+            max_null_ratio=max_null_ratio,
+            quantile_days=1,
         )
-        prices.drop(["id", "high", "hvol"], axis=1, inplace=True)
+        prices.drop(["id"], axis=1, inplace=True)
 
-        ts = prices.index.get_level_values(1)
-        span_secs = (ts.max() - ts.min()).total_seconds()
+        def get_nd_trend(n: int, idf: DataFrame):
+            name = idf.name
+            idf = idf[idf["time"] >= idf["time"].max() - Timedelta(days=n)]
+            x, y = idf["time"].astype(int) / (1e9 * 86400), idf["low"].values
+            x -= x.iloc[0]
+            slope, intercept, r_value, p_value, std_err = linregress(x, y)
+            return 100 * slope / n / meta.loc[name, "q50_low"]
 
-        # number of 4-hour spans
-        n_spans = span_secs / (86400 / 6)
+        meta["q50_mid"] = 0.5 * (meta["q50_low"] + meta["q50_high"])
+        meta["trend_%/d_7d"] = prices.groupby("name").apply(partial(get_nd_trend, 7))
+        meta["trend_%/d_30d"] = prices.groupby("name").apply(partial(get_nd_trend, 30))
 
-        by_name = prices.groupby("name")
+        meta["margin"] = meta["q80_high"] - meta["q20_low"] - 0.01 * meta["q50_low"]
+        meta["flow"] = np.minimum(0.15 * meta["4h_vol"], meta["limit"])
+        meta["score"] = meta["flow"] * meta["margin"]
+        meta["capex"] = meta["q50_low"] * meta["flow"]
+        meta["roi"] = meta["score"] / meta["capex"]
 
-        means = by_name[["low"]].mean()
-        means = means.join(by_name["lvol"].agg(lambda s: s.sum() / n_spans))
-        means = means.join(meta)
-        means.query(
-            (
-                f"low <= {max_price} & low >= {min_price}"
-                f"& lvol >= {min_4h_vol}"
-                f"& null_ratio <= {max_null_ratio}"
-            ),
-            inplace=True,
-        )
+        meta_clean = meta.drop(list(meta.filter(regex="^q")), axis=1)
+        meta_clean["q50"] = meta["q50_mid"]
+        meta_clean.sort_values("score", ascending=False, inplace=True)
+        meta_clean = meta_clean[
+            (meta_clean["trend_%/d_7d"].abs() < 0.35) & (meta_clean["trend_%/d_30d"].abs() < 0.35)
+        ]
+        meta_clean = meta_clean[(meta_clean["capex"] >= 3000000)]
+        meta_clean = meta_clean[meta_clean["flow"] >= 1000]
 
-        def jitter(s: Series) -> float:
-            trunc = s.values[-jitter_lookback_days * 24 * 12 :]
-            q3, q97 = np.quantile(trunc, [0.03, 0.97])
-            clipped = s.clip(q3, q97)
-            poly_detrend(clipped.values, detrend_order)
-            return clipped.mad()
-
-        jitter = by_name["low"].agg(lambda s: jitter(s))
-        jitter.name = "jitter"
-
-        q50 = meta["q50"]
-        rel_jitter = jitter / q50
-        rel_jitter.name = "rel_jitter"
-
-        joint = means.join([jitter, rel_jitter])
-        joint["4h_cashflow"] = joint["lvol"] * joint["low"]
-
-        effective_limit = np.minimum(joint["lmt"], joint["lvol"])
-        effective_swing = np.minimum(joint["jitter"], joint.eval("q80 - q20 - 1")).clip(
-            lower=0
-        )
-
-        self.api.refresh_1h()
-        self.api.refresh_5m()
-
-        d5m = (
-            joint.index.map(
-                lambda x: self.api.prices_5m[x]["avgLowPrice"]
-                if x in self.api.prices_5m
-                else None
-            ).to_series(index=joint.index)
-            - q50
-        ) / q50
-        d5m.name = "d5m"
-        d1h = (
-            joint.index.map(
-                lambda x: self.api.prices_1h[x]["avgLowPrice"]
-                if x in self.api.prices_1h
-                else None
-            ).to_series(index=joint.index)
-            - q50
-        ) / q50
-        d1h.name = "d1h"
-
-        joint = joint.join([d1h, d5m])
-
-        joint["profit"] = effective_swing * effective_limit
-        joint["capex"] = joint["q20"] * effective_limit
-        joint["roi"] = 100 * joint["profit"] / joint["capex"]
-
-        joint.query(
-            (
-                f"null_ratio <= {max_null_ratio}"
-                f"& jitter >= {min_jitter} "
-                f"& profit >= {min_profit} "
-                f"& abs(trend) <= {max_trend}"
-                f"& roi >= {min_roi}"
-            ),
-            inplace=True,
-        )
-
-        joint["trend"] = joint["trend"].abs()
-
-        print(joint.sort_values("profit"))
+        print(meta_clean.sort_values("score"))
 
     def scan_ha(self, min_profit: int = 500):
         @dataclass()
@@ -267,14 +200,9 @@ class Grifter:
 
         plt.show()
 
-    def scan_drop(self):
+    def scan_drop(self, min_drop: float = 0.8) -> NoReturn:
 
-        _, meta = self.api.load_universe(
-            window_days=7,
-            max_low_na_ratio=0.3,
-            min_4h_vol=5000,
-            min_low=50,
-        )
+        _, meta = self.api.load_universe(window_days=7, max_null_ratio=0.3, min_4h_vol=5000, min_low=50)
 
         cur_lows = {}
         new_lows = {}
@@ -290,7 +218,7 @@ class Grifter:
 
                 high = out[name]["high"]
 
-                base_q50 = meta.loc[name, "q50"]
+                base_q50 = meta.loc[name, "q50_low"]
                 p_q50 = (high + 10) / (base_q50 + 10)
 
                 try:
@@ -309,14 +237,12 @@ class Grifter:
                 drop = min(p_q50, p_1h, p_5m)
                 base = min([base_5m, base_1h, base_q50])
 
-                if drop < 0.8 or base - high > 150:
+                if drop < min_drop or base - high > 150:
                     new_lows[name] = high, base, drop
 
             for name, (high, base, drop) in new_lows.items():
                 if name not in cur_lows:
-                    print(
-                        f"{datetime.now()}: {name}: {high=:.0f}, {base=:.0f}, {drop=:.3f}"
-                    )
+                    print(f"{datetime.now()}: {name}: {high=:.0f}, {base=:.0f}, {drop=:.3f}")
 
             cur_lows.clear()
             cur_lows |= new_lows
@@ -354,11 +280,7 @@ class Grifter:
 # TODO scanner: mad(1d) / mad(3d) [recent price instability]
 
 
-def plot_price_volume(
-    names: Iterable[str],
-    df: DataFrame,
-    smooth: str = "30min",
-):
+def plot_price_volume(names: Iterable[str], df: DataFrame, smooth: str = "30min"):
     fig, (ax_p, ax_v) = plt.subplots(2, 1)
 
     for name in names:
@@ -380,7 +302,13 @@ def plot_price_volume(
 
 
 if __name__ == "__main__":
-
-    api = PriceAPI(refresh=True)
+    api = PriceAPI(refresh=False)
     grift = Grifter(api=api)
-    grift.scan_var(min_price=5, max_price=200_000, min_4h_vol=2500)
+
+    # crft = 56
+    # gem_recipes = [get_opal_recipe(crft), get_jade_recipe(crft), get_rtopaz_recipe(crft)]
+
+    # for recipe in gem_recipes + JEWEL_RECIPES:
+    #     grift.value_chain_snapshot_1h(recipe)
+
+    grift.scan_var(min_price=100, max_price=200_000, min_4h_vol=500, min_limit=200)

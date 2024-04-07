@@ -1,0 +1,8 @@
+numpy
+colored
+matplotlib
+obspy
+scipy
+pandas
+tqdm
+click

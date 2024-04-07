@@ -2,8 +2,8 @@
 
 from argparse import ArgumentParser
 
-from src.api import PriceAPI
-from src.grifter import Grifter
+from src.merch.api import PriceAPI
+from src.merch.grifter import Grifter
 
 
 def main():
@@ -18,13 +18,17 @@ def main():
     parser.add_argument("--min-price", type=int, help="minimum profit", default=5)
     parser.add_argument("--max-price", type=int, help="max price", default=15_000)
     parser.add_argument("--min-vol", type=int, help="minimum profit", default=2500)
-    parser.add_argument("--max-null", type=float, help="max null ratio", default=0.3)
-    parser.add_argument("--items", "-i", type=str, nargs='+')
+    parser.add_argument("--max-null", type=float, help="max null ratio", default=0.5)
+    parser.add_argument("--items", "-i", type=str, nargs="+")
 
     args = parser.parse_args()
 
-    api = PriceAPI(refresh=args.refresh)
+    # use 'refresh' as a filler "no-op" command to refresh data
+    api = PriceAPI(refresh=args.refresh or args.cmd == "refresh")
     grifter = Grifter(api=api)
+
+    if args.cmd == "refresh":
+        return
 
     print("Grifter is here.")
 
@@ -40,7 +44,7 @@ def main():
     elif args.cmd == "drop":
         print("Scanning for price drops...")
         grifter.scan_drop()
-    elif args.cmd == 'feed':
+    elif args.cmd == "feed":
         grifter.live_feed([it.capitalize() for it in args.items])
     else:
         raise NotImplementedError(f"command {args.cmd} not understood")
